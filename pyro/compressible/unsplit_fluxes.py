@@ -403,44 +403,66 @@ def apply_transverse_flux(U_xl, U_xr, U_yl, U_yr,
         Left and right normal conserved states in x and y interfaces
         with source terms added.
     """
+    from pyro.mesh.face_motion import get_face_speed
 
     myg = my_data.grid
 
-    # Use Riemann Solver to get interface flux using the left and right states
+    # ------------------------------------------------------------------
+    # Riemann fluxes (and sampled face states) in both directions
+    # We ALWAYS request the conservative face state so we can apply
+    # ALE: F_face <- F_face - S_f * U_face_sampled at moving faces.
+    # ------------------------------------------------------------------
+    F_x, U_x = riemann.riemann_flux(1, U_xl, U_xr,
+                                    my_data, rp, ivars,
+                                    solid.xl, solid.xr, tc,
+                                    return_cons=True)
 
-    if myg.coord_type == 1:
-        # We need pressure from interface state for transverse update for
-        # SphericalPolar geometry. So we need interface conserved states.
-        F_x, U_x = riemann.riemann_flux(1, U_xl, U_xr,
-                                        my_data, rp, ivars,
-                                        solid.xl, solid.xr, tc,
-                                        return_cons=True)
+    F_y, U_y = riemann.riemann_flux(2, U_yl, U_yr,
+                                    my_data, rp, ivars,
+                                    solid.yl, solid.yr, tc,
+                                    return_cons=True)
 
-        F_y, U_y = riemann.riemann_flux(2, U_yl, U_yr,
-                                        my_data, rp, ivars,
-                                        solid.yl, solid.yr, tc,
-                                        return_cons=True)
+    # -------------------------------
+    # ALE boundary-flux correction
+    # -------------------------------
+    # Face speed model from runtime params (piston-style: constant/sine + ramp)
+    def _Sf(edge: str, i: int, j: int) -> float:
+        """
+        Evaluate the user-registered face-speed function for this edge/face.
+        Edges: "xlb","xrb","ylb","yrb".
+        """
+        edge_key = {"xlb": "mesh.xlboundary", "xrb": "mesh.xrboundary",
+                    "ylb": "mesh.ylboundary", "yrb": "mesh.yrboundary"}[edge]
+        bname = rp.get_param(edge_key, "")
+        fn = get_face_speed(bname)
+        if fn is None:
+            return 0.0
+        if edge in ("xlb", "xrb"):
+            x_face, y_face = myg.xf[i], myg.yc[j]
+        else:
+            x_face, y_face = myg.xc[i], myg.yf[j]
+        return float(fn(my_data.t, edge, i, j, x_face, y_face))
 
-        gamma = rp.get_param("eos.gamma")
+    # Correct x-faces (left/right) if moving
+    i_left, i_right = myg.ilo, myg.ihi + 1
+    for j in range(myg.jlo, myg.jhi + 1):
+        Sf = _Sf("xlb", i_left, j)
+        if Sf: F_x.d[i_left, j, :] -= Sf * U_x.d[i_left, j, :]
+        Sf = _Sf("xrb", i_right, j)
+        if Sf: F_x.d[i_right, j, :] -= Sf * U_x.d[i_right, j, :]
 
-        # Find primitive variable since we need pressure in transverse update.
-        qx = comp.cons_to_prim(U_x, gamma, ivars, myg)
-        qy = comp.cons_to_prim(U_y, gamma, ivars, myg)
+    # Correct y-faces (bottom/top) if moving
+    j_bot, j_top = myg.jlo, myg.jhi + 1
+    for i in range(myg.ilo, myg.ihi + 1):
+        Sf = _Sf("ylb", i, j_bot)
+        if Sf: F_y.d[i, j_bot, :] -= Sf * U_y.d[i, j_bot, :]
+        Sf = _Sf("yrb", i, j_top)
+        if Sf: F_y.d[i, j_top, :] -= Sf * U_y.d[i, j_top, :]
 
-    else:
-        # Directly calculate the interface flux using Riemann Solver
-        F_x = riemann.riemann_flux(1, U_xl, U_xr,
-                                   my_data, rp, ivars,
-                                   solid.xl, solid.xr, tc,
-                                   return_cons=False)
-
-        F_y = riemann.riemann_flux(2, U_yl, U_yr,
-                                   my_data, rp, ivars,
-                                   solid.yl, solid.yr, tc,
-                                   return_cons=False)
-
+    # ------------------------------------------------------------------
     # Now we update the conserved states using the transverse fluxes.
-
+    # (identical to stock code below)
+    # ------------------------------------------------------------------
     tm_transverse = tc.timer("transverse flux addition")
     tm_transverse.begin()
 
@@ -452,41 +474,47 @@ def apply_transverse_flux(U_xl, U_xr, U_yl, U_yr,
 
         # U_xl[i,j,:] = U_xl[i,j,:] - 0.5*dt/dy * (F_y[i-1,j+1,:] - F_y[i-1,j,:])
         U_xl.v(buf=b, n=n)[:, :] += \
-            - hdtV.v(buf=b)*(F_y.ip_jp(-1, 1, buf=b, n=n)*myg.Ay.ip_jp(-1, 1, buf=b) -
+            - hdtV.v(buf=b)*(F_y.ip_jp(-1, 1, buf=b, n=n)*myg.Ay.ip_jp(-1, 1, buf=b) - \
                              F_y.ip(-1, buf=b, n=n)*myg.Ay.ip(-1, buf=b))
 
         # U_xr[i,j,:] = U_xr[i,j,:] - 0.5*dt/dy * (F_y[i,j+1,:] - F_y[i,j,:]
         U_xr.v(buf=b, n=n)[:, :] += \
-            - hdtV.v(buf=b)*(F_y.jp(1, buf=b, n=n)*myg.Ay.jp(1, buf=b) -
+            - hdtV.v(buf=b)*(F_y.jp(1, buf=b, n=n)*myg.Ay.jp(1, buf=b) - \
                              F_y.v(buf=b, n=n)*myg.Ay.v(buf=b))
 
         # U_yl[i,j,:] = U_yl[i,j,:] - 0.5*dt/dx * (F_x[i+1,j-1,:] - F_x[i,j-1,:])
         U_yl.v(buf=b, n=n)[:, :] += \
-            - hdtV.v(buf=b)*(F_x.ip_jp(1, -1, buf=b, n=n)*myg.Ax.ip_jp(1, -1, buf=b) -
+            - hdtV.v(buf=b)*(F_x.ip_jp(1, -1, buf=b, n=n)*myg.Ax.ip_jp(1, -1, buf=b) - \
                              F_x.jp(-1, buf=b, n=n)*myg.Ax.jp(-1, buf=b))
 
         # U_yr[i,j,:] = U_yr[i,j,:] - 0.5*dt/dx * (F_x[i+1,j,:] - F_x[i,j,:])
         U_yr.v(buf=b, n=n)[:, :] += \
-            - hdtV.v(buf=b)*(F_x.ip(1, buf=b, n=n)*myg.Ax.ip(1, buf=b) -
+            - hdtV.v(buf=b)*(F_x.ip(1, buf=b, n=n)*myg.Ax.ip(1, buf=b) - \
                              F_x.v(buf=b, n=n)*myg.Ax.v(buf=b))
 
     # apply non-conservative pressure gradient for momentum in spherical geometry
     # Note that we should only apply this pressure gradient
     # to the momentum corresponding to the transverse direction.
     # The momentum in the normal direction already updated pressure during reconstruction.
-
     if myg.coord_type == 1:
 
-        U_xl.v(buf=b, n=ivars.iymom)[:, :] += - hdt * (qy.ip_jp(-1, 1, buf=b, n=ivars.ip) -
+        # We need pressure from interface state for transverse update
+        gamma = rp.get_param("eos.gamma")
+
+        # Find primitive variable since we need pressure in transverse update.
+        qx = comp.cons_to_prim(U_x, gamma, ivars, myg)
+        qy = comp.cons_to_prim(U_y, gamma, ivars, myg)
+
+        U_xl.v(buf=b, n=ivars.iymom)[:, :] += - hdt * (qy.ip_jp(-1, 1, buf=b, n=ivars.ip) - \
                                                        qy.ip(-1, buf=b, n=ivars.ip)) / myg.Ly.v(buf=b)
 
-        U_xr.v(buf=b, n=ivars.iymom)[:, :] += - hdt * (qy.jp(1, buf=b, n=ivars.ip) -
+        U_xr.v(buf=b, n=ivars.iymom)[:, :] += - hdt * (qy.jp(1, buf=b, n=ivars.ip) - \
                                                        qy.v(buf=b, n=ivars.ip)) / myg.Ly.v(buf=b)
 
-        U_yl.v(buf=b, n=ivars.ixmom)[:, :] += - hdt * (qx.ip_jp(1, -1, buf=b, n=ivars.ip) -
+        U_yl.v(buf=b, n=ivars.ixmom)[:, :] += - hdt * (qx.ip_jp(1, -1, buf=b, n=ivars.ip) - \
                                                        qx.jp(-1, buf=b, n=ivars.ip)) / myg.Lx.v(buf=b)
 
-        U_yr.v(buf=b, n=ivars.ixmom)[:, :] += - hdt * (qx.ip(1, buf=b, n=ivars.ip) -
+        U_yr.v(buf=b, n=ivars.ixmom)[:, :] += - hdt * (qx.ip(1, buf=b, n=ivars.ip) - \
                                                        qx.v(buf=b, n=ivars.ip)) / myg.Lx.v(buf=b)
 
     tm_transverse.end()
