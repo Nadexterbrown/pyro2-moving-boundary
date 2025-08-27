@@ -712,7 +712,7 @@ def riemann_hllc(idir, ng,
         Conserved flux
     """
 
-    # Only Cartesian2d is supported in HLLC
+    # Only Cartesian 2d is supported in HLLC
     coord_type = 0
 
     qx, qy, nvar = U_l.shape
@@ -730,6 +730,10 @@ def riemann_hllc(idir, ng,
     ihi = ng + nx
     jlo = ng
     jhi = ng + ny
+
+    # Booleans for whether the lower/upper boundaries are solid (nonzero/True)
+    lower_is_solid = bool(lower_solid)
+    upper_is_solid = bool(upper_solid)
 
     for i in range(ilo - 1, ihi + 1):
         for j in range(jlo - 1, jhi + 1):
@@ -771,13 +775,9 @@ def riemann_hllc(idir, ng,
             S_l, S_r = estimate_wave_speed(rho_l, un_l, p_l, c_l,
                                            rho_r, un_r, p_r, c_r, gamma)
 
-            #  We could just take S_c = u_star as the estimate for the
-            #  contact speed, but we can actually do this more accurately
-            #  by using the Rankine-Hugonoit jump conditions across each
-            #  of the waves (see Toro 10.58, Batten et al. SIAM
-            #  J. Sci. and Stat. Comp., 18:1553 (1997)
+            # contact speed (star-region velocity)
             S_c = (p_r - p_l + rho_l * un_l * (S_l - un_l) - rho_r * un_r * (S_r - un_r)) / \
-                (rho_l * (S_l - un_l) - rho_r * (S_r - un_r))
+                  (rho_l * (S_l - un_l) - rho_r * (S_r - un_r))
 
             # figure out which region we are in and compute the state and
             # the interface fluxes using the HLLC Riemann solver
@@ -855,7 +855,19 @@ def riemann_hllc(idir, ng,
                                       idens, ixmom, iymom, iener, irhoX, nspec,
                                       U_state)
 
-            # we should deal with solid boundaries somehow here
+            # ALE correction at moving solid boundaries
+            # * Apply only on boundary faces.
+            # * Use S_c as the wall speed proxy (u* ≈ wall speed when ghosts enforce the piston).
+            if idir == 1:
+                is_lower_face = (i == ilo - 1)
+                is_upper_face = (i == ihi)
+            else:
+                is_lower_face = (j == jlo - 1)
+                is_upper_face = (j == jhi)
+
+            if (is_lower_face and lower_is_solid) or (is_upper_face and upper_is_solid):
+                # F <- F - S_f U*, with S_f ≈ S_c and U* ≡ U_state of the sampled branch
+                F[i, j, :] -= S_c * U_state[:]
 
     return F
 
